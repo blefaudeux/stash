@@ -12,6 +12,7 @@ build/
 develop-eggs/
 dist/
 downloads/
+checkpoints/
 eggs/
 .eggs/
 lib/
@@ -192,3 +193,6 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+
+mlruns
