@@ -1,0 +1,21 @@
+[tool.ruff]
+# Enable automatic fixing of lint errors
+fix = true
+indent-width = 2
+line-length = 120
+
+# Exclude commonly ignored directories
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pypackages__",
+]
+
+[tool.ruff.format]
+indent-style = "space"
+
+# Other formatting options can be added here
+quote-style = "double"
+line-ending = "auto"
