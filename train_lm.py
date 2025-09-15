@@ -8,15 +8,18 @@ import numpy as np
 import math
 import mlflow
 import glob
-from torch.optim.lr_scheduler import LambdaLR, SequentialLR, CosineAnnealingLR
+
+load_checkpoints = False
+
+masked_loss = True
 
 # Hyperparameters
 sz = 512  # one line of poem is roughly 50 characters
 batch_size = 1024
-micro_batch_size = 64
+micro_batch_size = 32
 d_model = 768
 n_head = 12
-n_layers = 12
+n_layers = 16
 d_feedforward = d_model * 4
 dtype = torch.bfloat16
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -29,7 +32,7 @@ min_lr = 1e-6
 num_epochs = 10
 grad_clip = 1.0
 dropout = 0.1
-
+masked_token = 64
 log_period = 50  # Counts the forwards, not the optimizer steps
 save_period = 3000  # Counts the optimizer steps
 
@@ -45,8 +48,11 @@ class CharDataset(Dataset):
     self.string_to_int = {ch: i for i, ch in enumerate(chars)}
     self.int_to_string = {i: ch for i, ch in enumerate(chars)}
     self.block_size = block_size
-    self.vocab_size = vocab_size
+    self.vocab_size = vocab_size + 1  # accommodate for the masked token
     self.books = data.split("\n\n\n")
+
+    self.string_to_int["[MASK]"] = vocab_size
+    self.int_to_string[vocab_size] = "[MASK]"
 
     # Boundaries are the cumsum of the book lengths
     book_lengths = [len(book) for book in self.books]
@@ -121,7 +127,8 @@ class TransformerLM(nn.Module):
       diagonal=1,
     )
 
-  def forward(self, tokens):
+  def forward(self, tokens: torch.Tensor):
+    """The normal, autoregressive path"""
     # Embed the raw tokens
     x = self.embedding(tokens)
 
@@ -133,6 +140,21 @@ class TransformerLM(nn.Module):
     logits = self.lm_head(x)
 
     return logits  # return logits, we'll move to probabilities in generate()
+
+  def forward_masked(self, tokens: torch.Tensor, eps: float = 1e-8):
+    """Masked diffusion process, as per LLaDA
+    https://github.com/ML-GSAI/LLaDA"""
+
+    batch, sequence = tokens.shape
+    t = torch.rand(batch, device=tokens.device)
+    p_mask = (1 - eps) * t + eps
+    p_mask = p_mask[:, None].repeat(1, sequence)
+
+    masked_indices = torch.rand((batch, sequence), device=tokens.device) < p_mask
+
+    # masked_token is used for [MASK] token
+    noisy_batch = torch.where(masked_indices, masked_token, tokens)
+    return noisy_batch, masked_indices, p_mask
 
   @torch.inference_mode()
   def generate(
@@ -198,23 +220,25 @@ train_loader = DataLoader(
 model = TransformerLM(dataset.vocab_size, d_model, n_head, n_layers, d_feedforward, sz).to(
   device=device, dtype=torch.bfloat16
 )
+model = torch.compile(model)  # type: ignore
+# model = StashWrap(model) # Offset activations to CPU
 
 # Load possible existing checkpoint
 # - list all the existing checkpoints and use the latest one
 # - if no checkpoint exists, start from scratch
-checkpoints = glob.glob("checkpoints/*.pt")
-if len(checkpoints) > 0:
-  checkpoints.sort()
-  print(f"Loading checkpoint {checkpoints[-1]}")
-  state_dict = torch.load(checkpoints[-1], weights_only=True)
+if load_checkpoints:
+  checkpoints = glob.glob("checkpoints/*.pt")
+  if len(checkpoints) > 0:
+    checkpoints.sort()
+    print(f"Loading checkpoint {checkpoints[-1]}")
+    state_dict = torch.load(checkpoints[-1], weights_only=True)
 
-  # Remove the _orig_mod. prefix from the keys
-  state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-  model.load_state_dict(state_dict)
-  model.to(device=device, dtype=torch.bfloat16)
+    # Remove the _orig_mod. prefix from the keys
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    model.to(device=device, dtype=torch.bfloat16)
 
 
-model = torch.compile(model)  # type: ignore
 trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Trainable parameters: {trainable_parameters / 1e6:.2f}M")
 
@@ -223,16 +247,16 @@ optimizer.zero_grad()
 
 
 def warmup_cosine_decay(step, warmup_steps, total_steps, max_lr, min_lr):
-    if step < warmup_steps:
-        # Linear warmup
-        return (step + 1) / warmup_steps * max_lr
-    else:
-        # Cosine decay
-        cosine_decay = 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps)))
-        return min_lr + (max_lr - min_lr) * cosine_decay
+  if step < warmup_steps:
+    # Linear warmup
+    return (step + 1) / warmup_steps * max_lr
+  else:
+    # Cosine decay
+    cosine_decay = 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps)))
+    return min_lr + (max_lr - min_lr) * cosine_decay
 
 
-def train(model, train_loader):
+def train(model, train_loader, use_masked_loss: bool = False):
   model.train()
 
   avg_loss, n_loss = 0.0, 0
@@ -255,8 +279,25 @@ def train(model, train_loader):
       param_group["lr"] = lr
 
     # Update loop
-    logits = model(src)
-    loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), tgt.view(-1), ignore_index=-1)
+    if use_masked_loss:
+      if torch.rand(1) < 0.01:
+        # We set 1% of the pre-training data to a random length that is uniformly sampled from the range [1, 4096].
+        random_length = torch.randint(1, src.shape[1] + 1, (1,))
+        src = src[:, :random_length]
+
+      noisy_batch, masked_indices, p_mask = model.forward_masked(src)
+      logits = model(tokens=noisy_batch.contiguous())
+
+      token_loss = (
+        nn.functional.cross_entropy(logits[masked_indices], src[masked_indices], reduction="none")
+        / p_mask[masked_indices]
+      )
+      loss = token_loss.sum() / (src.shape[0] * src.shape[1])
+
+    else:
+      # Normal autoregressive flow with cross-entropy loss
+      logits = model(src)
+      loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), tgt.view(-1), ignore_index=-1)
 
     # Compute the grads, accumulate if need be
     loss.backward()
@@ -305,9 +346,10 @@ with mlflow.start_run():
     "dropout": dropout,
     "max_seq_len": sz,
     "dataset": "shakespeare",
+    "masked_loss": masked_loss,
   }
   mlflow.log_params(params)
 
   for epoch in range(1, num_epochs + 1):
-    loss = train(model, train_loader)
+    loss = train(model, train_loader, use_masked_loss=masked_loss)
     print(f"Epoch {epoch}, Loss: {loss:.4f}")
